@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# ---------- Minimal command discovery ----------
 LS_CMD=$(command -pv ls 2>/dev/null)
 LS_CMD=${LS_CMD:-/bin/ls}
 DIRNAME_CMD=$(command -pv dirname 2>/dev/null)
@@ -17,7 +16,7 @@ SED_CMD=${SED_CMD:-/bin/sed}
 VI_CMD=$(command -pv vi 2>/dev/null)
 VI_CMD=${VI_CMD:-vi}
 
-# ---------- ANSI helpers (no tput) ----------
+# ANSI (no tput)
 clr() { printf '\033[2J\033[H'; }
 move() { printf '\033[%d;%dH' "$1" "$2"; }
 rev_on() { printf '\033[7m'; }
@@ -25,8 +24,7 @@ dim_on() { printf '\033[2m'; }
 dim_off() { printf '\033[22m'; }
 reset() { printf '\033[0m'; }
 
-# ---------- State: two panes ----------
-PANE_ACTIVE=0 # 0=left, 1=right
+PANE_ACTIVE=0
 PANE_DIR[0]="${1:-$PWD}"
 PANE_DIR[1]="${2:-$PWD}"
 PANE_SEL[0]=0
@@ -34,12 +32,12 @@ PANE_SEL[1]=0
 PANE_FILTER[0]=""
 PANE_FILTER[1]=""
 
-# Clipboard (single item)
 CLIP_MODE="" # copy|move
 CLIP_NAME=""
 CLIP_SRC=""
 
-# ---------- Sorting (no sort) ----------
+STATUS_MSG=""
+
 bubblesort() {
   local arr=("$@") tmp n=${#arr[@]}
   for ((i = 0; i < n; i++)); do
@@ -54,7 +52,6 @@ bubblesort() {
   echo "${arr[@]}"
 }
 
-# ---------- Build items for a pane (global ITEMS/ITEM_COUNT) ----------
 build_items() {
   local dir="$1" filter="$2"
   local -a all folders files
@@ -77,7 +74,6 @@ build_items() {
   ITEM_COUNT=${#ITEMS[@]}
 }
 
-# ---------- Truncate ----------
 truncate() {
   local s="$1" w="$2"
   if ((${#s} <= w)); then
@@ -89,7 +85,6 @@ truncate() {
   fi
 }
 
-# ---------- Text-editable detection (fixed case patterns) ----------
 is_text_editable() {
   local name="$1"
   local ext="${name##*.}"
@@ -101,39 +96,24 @@ is_text_editable() {
   [[ "$ext" == "$name" ]] && return 1
 
   case "$ext" in
-  txt | md | rst | log | ini | conf | cfg | toml | yaml | yml | json | xml | csv | tsv | env | gitignore | editorconfig | diff | patch)
-    return 0
-    ;;
-  sh | bash | zsh | ksh | fish | profile | bashrc | zshrc)
-    return 0
-    ;;
-  py | rb | pl | php | js | ts | jsx | tsx | lua | go | rs | c | h | cpp | hpp | cc | java | kt | cs | swift)
-    return 0
-    ;;
-  sql | html | css | scss | sass)
-    return 0
-    ;;
-  service | timer | socket | mount | target | path)
-    return 0
-    ;;
-  vim | vimrc | tmux)
-    return 0
-    ;;
+  txt | md | rst | log | ini | conf | cfg | toml | yaml | yml | json | xml | csv | tsv | env | diff | patch) return 0 ;;
+  sh | bash | zsh | ksh | fish | profile | bashrc | zshrc) return 0 ;;
+  py | rb | pl | php | js | ts | jsx | tsx | lua | go | rs | c | h | cpp | hpp | cc | java | kt | cs | swift) return 0 ;;
+  sql | html | css | scss | sass) return 0 ;;
+  service | timer | socket | mount | target | path) return 0 ;;
+  vim | vimrc | tmux) return 0 ;;
   esac
 
   return 1
 }
 
-# ---------- Preview (sed only) ----------
 preview_text() {
   local path="$1" max_lines="$2"
   "$SED_CMD" -n "1,${max_lines}p" "$path" 2>/dev/null || echo "(binary/unreadable)"
 }
 
-# ---------- Draw one pane ----------
 draw_pane() {
   local pane="$1" x="$2" y="$3" w="$4" h="$5"
-
   local dir="${PANE_DIR[$pane]}"
   local sel="${PANE_SEL[$pane]}"
   local filter="${PANE_FILTER[$pane]}"
@@ -206,20 +186,208 @@ draw_pane() {
   done
 }
 
-# ---------- Draw full UI ----------
+active_dir() { echo "${PANE_DIR[$PANE_ACTIVE]}"; }
+
+active_item_path() {
+  local dir="${PANE_DIR[$PANE_ACTIVE]}"
+  local filter="${PANE_FILTER[$PANE_ACTIVE]}"
+  local sel="${PANE_SEL[$PANE_ACTIVE]}"
+  build_items "$dir" "$filter"
+  ((ITEM_COUNT == 0)) && return 1
+  echo "$dir/${ITEMS[$sel]}"
+}
+
+open_item() {
+  local p
+  p="$(active_item_path)" || return 0
+  if [[ -d "$p" ]]; then
+    PANE_DIR[$PANE_ACTIVE]="$p"
+    PANE_SEL[$PANE_ACTIVE]=0
+    PANE_FILTER[$PANE_ACTIVE]=""
+    STATUS_MSG=""
+    return 0
+  fi
+
+  if is_text_editable "${p##*/}"; then
+    if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+    echo "Editing: ${p##*/}"
+    echo "Exit editor to return (vi: Esc, then :q, Enter)"
+    echo "------------------------------------------------"
+    "$VI_CMD" "$p"
+  else
+    if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+    echo "Viewing: ${p##*/}"
+    echo "Press 'q' to return"
+    echo "------------------------------------------------"
+    "${PAGER:-less}" "$p"
+  fi
+  STATUS_MSG=""
+}
+
+go_up() {
+  local dir="${PANE_DIR[$PANE_ACTIVE]}"
+  PANE_DIR[$PANE_ACTIVE]=$("$DIRNAME_CMD" "$dir" 2>/dev/null || echo "${dir%/*}")
+  [[ -z "${PANE_DIR[$PANE_ACTIVE]}" ]] && PANE_DIR[$PANE_ACTIVE]="/"
+  PANE_SEL[$PANE_ACTIVE]=0
+  PANE_FILTER[$PANE_ACTIVE]=""
+  STATUS_MSG=""
+}
+
+do_copy() {
+  local p
+  p="$(active_item_path)" || {
+    STATUS_MSG="Nothing to copy"
+    return 0
+  }
+  CLIP_MODE="copy"
+  CLIP_NAME="${p##*/}"
+  CLIP_SRC="$p"
+  STATUS_MSG="Copied: $CLIP_NAME"
+}
+
+do_move() {
+  local p
+  p="$(active_item_path)" || {
+    STATUS_MSG="Nothing to move"
+    return 0
+  }
+  CLIP_MODE="move"
+  CLIP_NAME="${p##*/}"
+  CLIP_SRC="$p"
+  STATUS_MSG="Moving: $CLIP_NAME"
+}
+
+# ✅ FIX: paste goes into ACTIVE pane (so Tab to destination works)
+do_paste() {
+  [[ -z "$CLIP_MODE" || -z "$CLIP_SRC" || -z "$CLIP_NAME" ]] && {
+    STATUS_MSG="Clipboard empty"
+    return 0
+  }
+  [[ ! -e "$CLIP_SRC" ]] && {
+    STATUS_MSG="Source missing"
+    CLIP_MODE=""
+    CLIP_NAME=""
+    CLIP_SRC=""
+    return 0
+  }
+
+  local dest_dir
+  dest_dir="$(active_dir)"
+  local dest="$dest_dir/$CLIP_NAME"
+
+  if [[ "$CLIP_MODE" == "copy" ]]; then
+    if "$CP_CMD" -r "$CLIP_SRC" "$dest" 2>/dev/null; then
+      STATUS_MSG="Pasted: $CLIP_NAME"
+    else
+      STATUS_MSG="Paste failed (copy)"
+    fi
+  else
+    if "$MV_CMD" "$CLIP_SRC" "$dest" 2>/dev/null; then
+      STATUS_MSG="Moved here: $CLIP_NAME"
+      CLIP_MODE=""
+      CLIP_NAME=""
+      CLIP_SRC=""
+    else
+      STATUS_MSG="Paste failed (move)"
+    fi
+  fi
+}
+
+do_delete() {
+  local p
+  p="$(active_item_path)" || {
+    STATUS_MSG="Nothing to delete"
+    return 0
+  }
+  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+  printf "Delete '%s'? (y/N): " "${p##*/}"
+  read -r ans
+  [[ "$ans" != "y" && "$ans" != "Y" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  "$RM_CMD" -rf "$p" 2>/dev/null && STATUS_MSG="Deleted: ${p##*/}" || STATUS_MSG="Delete failed"
+  PANE_SEL[$PANE_ACTIVE]=0
+}
+
+do_rename() {
+  local p
+  p="$(active_item_path)" || {
+    STATUS_MSG="Nothing to rename"
+    return 0
+  }
+  local dir="${p%/*}" old="${p##*/}"
+  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+  printf "Rename '%s' to: " "$old"
+  read -r new
+  [[ -z "$new" || "$new" == "$old" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  if [[ -e "$dir/$new" ]]; then
+    printf "Target exists. Overwrite? (y/N): "
+    read -r ans
+    [[ "$ans" != "y" && "$ans" != "Y" ]] && {
+      STATUS_MSG="Cancelled"
+      return 0
+    }
+  fi
+  "$MV_CMD" "$dir/$old" "$dir/$new" 2>/dev/null && STATUS_MSG="Renamed" || STATUS_MSG="Rename failed"
+}
+
+do_new_folder() {
+  local dir
+  dir="$(active_dir)"
+  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+  printf "New folder name: "
+  read -r name
+  [[ -z "$name" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  mkdir -p "$dir/$name" 2>/dev/null && STATUS_MSG="Created folder: $name" || STATUS_MSG="Create folder failed"
+}
+
+do_new_file() {
+  local dir
+  dir="$(active_dir)"
+  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+  printf "New file name: "
+  read -r name
+  [[ -z "$name" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  : >"$dir/$name" 2>/dev/null && STATUS_MSG="Created file: $name" || STATUS_MSG="Create file failed"
+}
+
+do_filter() {
+  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
+  printf "Filter (active pane): "
+  read -r q
+  PANE_FILTER[$PANE_ACTIVE]="$q"
+  PANE_SEL[$PANE_ACTIVE]=0
+  STATUS_MSG="Filter set"
+}
+
+clear_filter() {
+  PANE_FILTER[$PANE_ACTIVE]=""
+  PANE_SEL[$PANE_ACTIVE]=0
+  STATUS_MSG="Filter cleared"
+}
+
 draw_screen() {
   local cols=${COLUMNS:-80}
   local lines=${LINES:-24}
 
   local top=1
-  local footer_h=3
+  local footer_h=4
   local preview_h=6
   local pane_h=$((lines - footer_h - preview_h - 1))
   ((pane_h < 6)) && pane_h=6
 
   local pane_w=$((cols / 2))
   ((pane_w < 20)) && pane_w=20
-
   local left_x=1
   local right_x=$((pane_w + 1))
 
@@ -228,7 +396,7 @@ draw_screen() {
   draw_pane 0 "$left_x" "$top" "$pane_w" "$pane_h"
   draw_pane 1 "$right_x" "$top" $((cols - pane_w + 1)) "$pane_h"
 
-  # Preview area
+  # Preview
   local preview_y=$((top + pane_h + 1))
   move "$preview_y" 1
   dim_on
@@ -241,11 +409,8 @@ draw_screen() {
   local afilter="${PANE_FILTER[$PANE_ACTIVE]}"
   local asel="${PANE_SEL[$PANE_ACTIVE]}"
   build_items "$adir" "$afilter"
-
   local path=""
-  if ((ITEM_COUNT > 0)); then
-    path="$adir/${ITEMS[$asel]}"
-  fi
+  if ((ITEM_COUNT > 0)); then path="$adir/${ITEMS[$asel]}"; fi
 
   local max_lines=$((preview_h - 2))
   local py=$((preview_y + 1))
@@ -273,7 +438,7 @@ draw_screen() {
     }
   fi
 
-  # Footer
+  # Footer help + status
   local footer_y=$((lines - footer_h + 1))
   move "$footer_y" 1
   printf "%-*s" "$cols" ""
@@ -283,155 +448,30 @@ draw_screen() {
   move $((footer_y + 1)) 1
   printf "%-*s" "$cols" ""
   move $((footer_y + 1)) 1
-  printf "[c] Copy  [m] Move  [p] Paste->Other  [r] Rename  [n] New Folder  [f] New File  [d] Delete  [q] Quit"
-}
+  printf "[c] Copy  [m] Move  [p] Paste (into active pane)  [r] Rename  [n] New Folder  [f] New File  [d] Delete  [q] Quit"
 
-# ---------- Helpers ----------
-active_dir() { echo "${PANE_DIR[$PANE_ACTIVE]}"; }
-inactive_dir() { echo "${PANE_DIR[$((1 - PANE_ACTIVE))]}"; }
-
-active_item_path() {
-  local dir="${PANE_DIR[$PANE_ACTIVE]}"
-  local filter="${PANE_FILTER[$PANE_ACTIVE]}"
-  local sel="${PANE_SEL[$PANE_ACTIVE]}"
-  build_items "$dir" "$filter"
-  ((ITEM_COUNT == 0)) && return 1
-  echo "$dir/${ITEMS[$sel]}"
-}
-
-# ---------- Enter behavior: folder->enter, text->vi, other->pager ----------
-open_item() {
-  local p
-  p="$(active_item_path)" || return 0
-  if [[ -d "$p" ]]; then
-    PANE_DIR[$PANE_ACTIVE]="$p"
-    PANE_SEL[$PANE_ACTIVE]=0
-    PANE_FILTER[$PANE_ACTIVE]=""
-    return 0
-  fi
-
-  if is_text_editable "${p##*/}"; then
-    if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-    echo "Editing: ${p##*/}"
-    echo "Exit editor to return (vi: Esc, then :q, Enter)"
-    echo "------------------------------------------------"
-    "$VI_CMD" "$p"
+  move $((footer_y + 2)) 1
+  printf "%-*s" "$cols" ""
+  move $((footer_y + 2)) 1
+  dim_on
+  if [[ -n "$CLIP_MODE" && -n "$CLIP_NAME" ]]; then
+    printf "%s" "$(truncate "Clipboard: [$CLIP_MODE] $CLIP_NAME   |   $STATUS_MSG" "$cols")"
   else
-    if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-    echo "Viewing: ${p##*/}"
-    echo "Press 'q' to return"
-    echo "------------------------------------------------"
-    "${PAGER:-less}" "$p"
+    printf "%s" "$(truncate "Clipboard: (empty)   |   $STATUS_MSG" "$cols")"
   fi
+  dim_off
 }
 
-go_up() {
-  local dir="${PANE_DIR[$PANE_ACTIVE]}"
-  PANE_DIR[$PANE_ACTIVE]=$("$DIRNAME_CMD" "$dir" 2>/dev/null || echo "${dir%/*}")
-  [[ -z "${PANE_DIR[$PANE_ACTIVE]}" ]] && PANE_DIR[$PANE_ACTIVE]="/"
-  PANE_SEL[$PANE_ACTIVE]=0
-  PANE_FILTER[$PANE_ACTIVE]=""
-}
-
-do_copy() {
-  local p
-  p="$(active_item_path)" || return 0
-  CLIP_MODE="copy"
-  CLIP_NAME="${p##*/}"
-  CLIP_SRC="$p"
-}
-do_move() {
-  local p
-  p="$(active_item_path)" || return 0
-  CLIP_MODE="move"
-  CLIP_NAME="${p##*/}"
-  CLIP_SRC="$p"
-}
-
-do_paste() {
-  [[ -z "$CLIP_MODE" || -z "$CLIP_SRC" || -z "$CLIP_NAME" ]] && return 0
-  [[ ! -e "$CLIP_SRC" ]] && return 0
-  local dest_dir
-  dest_dir="$(inactive_dir)"
-  local dest="$dest_dir/$CLIP_NAME"
-
-  if [[ "$CLIP_MODE" == "copy" ]]; then
-    "$CP_CMD" -r "$CLIP_SRC" "$dest" 2>/dev/null
-  else
-    "$MV_CMD" "$CLIP_SRC" "$dest" 2>/dev/null
-    CLIP_MODE=""
-    CLIP_NAME=""
-    CLIP_SRC=""
-  fi
-}
-
-do_delete() {
-  local p
-  p="$(active_item_path)" || return 0
-  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-  printf "Delete '%s'? (y/N): " "${p##*/}"
-  read -r ans
-  [[ "$ans" != "y" && "$ans" != "Y" ]] && return 0
-  "$RM_CMD" -rf "$p" 2>/dev/null
-  PANE_SEL[$PANE_ACTIVE]=0
-}
-
-do_rename() {
-  local p
-  p="$(active_item_path)" || return 0
-  local dir="${p%/*}" old="${p##*/}"
-  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-  printf "Rename '%s' to: " "$old"
-  read -r new
-  [[ -z "$new" || "$new" == "$old" ]] && return 0
-  if [[ -e "$dir/$new" ]]; then
-    printf "Target exists. Overwrite? (y/N): "
-    read -r ans
-    [[ "$ans" != "y" && "$ans" != "Y" ]] && return 0
-  fi
-  "$MV_CMD" "$dir/$old" "$dir/$new" 2>/dev/null
-}
-
-do_new_folder() {
-  local dir
-  dir="$(active_dir)"
-  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-  printf "New folder name: "
-  read -r name
-  [[ -z "$name" ]] && return 0
-  mkdir -p "$dir/$name" 2>/dev/null
-}
-
-do_new_file() {
-  local dir
-  dir="$(active_dir)"
-  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-  printf "New file name: "
-  read -r name
-  [[ -z "$name" ]] && return 0
-  : >"$dir/$name" 2>/dev/null
-}
-
-do_filter() {
-  if [[ -n "$CLEAR_CMD" ]]; then "$CLEAR_CMD"; else clr; fi
-  printf "Filter (active pane): "
-  read -r q
-  PANE_FILTER[$PANE_ACTIVE]="$q"
-  PANE_SEL[$PANE_ACTIVE]=0
-}
-
-clear_filter() {
-  PANE_FILTER[$PANE_ACTIVE]=""
-  PANE_SEL[$PANE_ACTIVE]=0
-}
-
-# ---------- Key loop ----------
+# Key loop
 while true; do
   draw_screen
   IFS= read -rsn1 key
 
   case "$key" in
-  $'\t') PANE_ACTIVE=$((1 - PANE_ACTIVE)) ;;
+  $'\t')
+    PANE_ACTIVE=$((1 - PANE_ACTIVE))
+    STATUS_MSG=""
+    ;;
   "") open_item ;;
   $'\x7f') go_up ;;
   /) do_filter ;;
