@@ -19,3 +19,18 @@ A pure Bash TUI file explorer designed to run in ultra-minimal Linux environment
 chmod +x xplor.sh
 cd "$(./xplor.sh)"
 
+## Running
+
+```sh
+./xplor
+
+xplor will automatically select:
+
+bash TUI mode on modern systems
+
+ksh88 (Harris-compatible) mode when ksh is detected
+
+Force a mode:
+
+XPLOR_MODE=tui ./xplor
+XPLOR_MODE=harris ./xplor

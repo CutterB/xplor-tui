@@ -1,0 +1,547 @@
+#!/usr/bin/env ksh
+
+# Require ksh (ksh93/mksh). If run under sh, bail clearly.
+[[ -z "$KSH_VERSION" && -z "$FCEDIT" ]] && {
+  print -u2 "xplor.ksh requires ksh (ksh93/mksh). Run: ksh ./xplor.ksh"
+  exit 1
+}
+
+# ---------- Minimal command discovery ----------
+LS_CMD=$(command -v ls 2>/dev/null)
+[[ -z "$LS_CMD" ]] && LS_CMD=/bin/ls
+DIRNAME_CMD=$(command -v dirname 2>/dev/null)
+[[ -z "$DIRNAME_CMD" ]] && DIRNAME_CMD=/usr/bin/dirname
+CLEAR_CMD=$(command -v clear 2>/dev/null)
+CP_CMD=$(command -v cp 2>/dev/null)
+[[ -z "$CP_CMD" ]] && CP_CMD=/bin/cp
+MV_CMD=$(command -v mv 2>/dev/null)
+[[ -z "$MV_CMD" ]] && MV_CMD=/bin/mv
+RM_CMD=$(command -v rm 2>/dev/null)
+[[ -z "$RM_CMD" ]] && RM_CMD=/bin/rm
+SED_CMD=$(command -v sed 2>/dev/null)
+[[ -z "$SED_CMD" ]] && SED_CMD=/bin/sed
+VI_CMD=$(command -v vi 2>/dev/null)
+[[ -z "$VI_CMD" ]] && VI_CMD=vi
+
+# ---------- ANSI helpers (no tput) ----------
+function clr { print -n -- $'\033[2J\033[H'; }
+function move {
+  typeset -i r=$1 c=$2
+  print -n -- $'\033['"$r"';'"$c"$'H'
+}
+function rev_on { print -n -- $'\033[7m'; }
+function dim_on { print -n -- $'\033[2m'; }
+function dim_off { print -n -- $'\033[22m'; }
+function reset { print -n -- $'\033[0m'; }
+
+# ---------- State ----------
+typeset -i PANE_ACTIVE=0
+typeset -a PANE_DIR PANE_SEL PANE_FILTER
+PANE_DIR[0]="${1:-$PWD}"
+PANE_DIR[1]="${2:-$PWD}"
+PANE_SEL[0]=0
+PANE_SEL[1]=0
+PANE_FILTER[0]=""
+PANE_FILTER[1]=""
+
+typeset CLIP_MODE="" # copy|move
+typeset CLIP_NAME=""
+typeset CLIP_SRC=""
+typeset STATUS_MSG=""
+
+typeset -a ITEMS
+typeset -i ITEM_COUNT=0
+
+# ---------- Utilities ----------
+function truncate {
+  typeset s="$1"
+  typeset -i w=$2
+  if ((${#s} <= w)); then
+    print -n -- "$s"
+  else
+    typeset -i cut=$((w - 1))
+    ((cut < 0)) && cut=0
+    print -n -- "${s:0:cut}…"
+  fi
+}
+
+function bubblesort {
+  # echoes sorted words, stable enough for our use
+  typeset -a arr
+  arr=("$@")
+  typeset -i n=${#arr[@]} i j
+  typeset tmp
+  for ((i = 0; i < n; i++)); do
+    for ((j = 0; j < n - i - 1; j++)); do
+      if [[ "${arr[j]}" > "${arr[j + 1]}" ]]; then
+        tmp="${arr[j]}"
+        arr[j]="${arr[j + 1]}"
+        arr[j + 1]="$tmp"
+      fi
+    done
+  done
+  print -r -- "${arr[@]}"
+}
+
+function is_text_editable {
+  typeset name="$1"
+  typeset ext="${name##*.}"
+
+  case "$name" in
+  Makefile | Dockerfile | README | LICENSE | COPYING | .gitignore | .gitattributes | .editorconfig) return 0 ;;
+  esac
+
+  [[ "$ext" == "$name" ]] && return 1
+
+  case "$ext" in
+  txt | md | rst | log | ini | conf | cfg | toml | yaml | yml | json | xml | csv | tsv | env | diff | patch) return 0 ;;
+  sh | bash | zsh | ksh | profile | bashrc | zshrc) return 0 ;;
+  c | h | cpp | hpp | cc | java | kt | cs | py | rb | pl | php | js | ts | lua | go | rs | swift) return 0 ;;
+  sql | html | css | scss | sass) return 0 ;;
+  service | timer | socket | mount | target | path) return 0 ;;
+  vim | vimrc | tmux) return 0 ;;
+  esac
+  return 1
+}
+
+function preview_text {
+  typeset path="$1"
+  typeset -i max_lines=$2
+  "$SED_CMD" -n "1,${max_lines}p" "$path" 2>/dev/null || print -r -- "(binary/unreadable)"
+}
+
+# Read ls output into an array safely (preserves spaces)
+function read_ls_into_array {
+  typeset dir="$1"
+  typeset -a out
+  out=()
+  typeset line
+  while IFS= read -r line; do
+    out[${#out[@]}]="$line"
+  done < <("$LS_CMD" -A "$dir" 2>/dev/null)
+  print -r -- "${out[@]}"
+}
+
+function build_items {
+  typeset dir="$1" filter="$2"
+  typeset -a all folders files
+  all=()
+  folders=()
+  files=()
+
+  typeset line
+  while IFS= read -r line; do
+    all[${#all[@]}]="$line"
+  done < <("$LS_CMD" -A "$dir" 2>/dev/null)
+
+  typeset item path
+  for item in "${all[@]}"; do
+    [[ -n "$filter" && "$item" != *"$filter"* ]] && continue
+    path="$dir/$item"
+    if [[ -d "$path" ]]; then
+      folders[${#folders[@]}]="$item"
+    else
+      files[${#files[@]}]="$item"
+    fi
+  done
+
+  typeset sorted_f sorted_x
+  sorted_f=$(bubblesort "${folders[@]}")
+  sorted_x=$(bubblesort "${files[@]}")
+
+  ITEMS=()
+  # rebuild ITEMS from the printed words (note: filenames with newlines are not supported anyway)
+  for item in $sorted_f; do ITEMS[${#ITEMS[@]}]="$item"; done
+  for item in $sorted_x; do ITEMS[${#ITEMS[@]}]="$item"; done
+
+  ITEM_COUNT=${#ITEMS[@]}
+}
+
+# ---------- Drawing ----------
+function draw_pane {
+  typeset -i pane=$1 x=$2 y=$3 w=$4 h=$5
+  typeset dir="${PANE_DIR[pane]}"
+  typeset -i sel=${PANE_SEL[pane]}
+  typeset filter="${PANE_FILTER[pane]}"
+
+  build_items "$dir" "$filter"
+
+  if ((ITEM_COUNT == 0)); then
+    sel=0
+  else
+    ((sel < 0)) && sel=$((ITEM_COUNT - 1))
+    ((sel >= ITEM_COUNT)) && sel=0
+  fi
+  PANE_SEL[pane]=$sel
+
+  move $y $x
+  ((pane == PANE_ACTIVE)) && rev_on
+  print -n -- " "
+  truncate "$dir" $((w - 2))
+  print -n -- " "
+  reset
+
+  move $((y + 1)) $x
+  dim_on
+  if [[ -n "$filter" ]]; then
+    print -n -- " "
+    truncate "Filter: $filter" $((w - 2))
+    print -n -- " "
+  else
+    print -n -- " "
+    truncate "Filter: (none)" $((w - 2))
+    print -n -- " "
+  fi
+  dim_off
+
+  typeset -i body_y=$((y + 2)) body_h=$((h - 2)) row
+  for ((row = 0; row < body_h; row++)); do
+    move $((body_y + row)) $x
+    print -n -- " "
+    truncate "" $((w - 2))
+    print -n -- " "
+  done
+
+  if ((ITEM_COUNT == 0)); then
+    move $body_y $x
+    dim_on
+    print -n -- " "
+    truncate "(empty)" $((w - 2))
+    print -n -- " "
+    dim_off
+    return
+  fi
+
+  typeset -i start end i
+  if ((ITEM_COUNT <= body_h)); then
+    start=0
+    end=$((ITEM_COUNT - 1))
+  else
+    start=$((sel - body_h / 2))
+    ((start < 0)) && start=0
+    end=$((start + body_h - 1))
+    ((end >= ITEM_COUNT)) && end=$((ITEM_COUNT - 1))
+    start=$((end - body_h + 1))
+    ((start < 0)) && start=0
+  fi
+
+  row=0
+  typeset item icon line
+  for ((i = start; i <= end; i++)); do
+    item="${ITEMS[i]}"
+    [[ -d "$dir/$item" ]] && icon="📁" || icon="📄"
+    line="$icon $item"
+    move $((body_y + row)) $x
+    ((i == sel && pane == PANE_ACTIVE)) && rev_on
+    print -n -- " "
+    truncate "$line" $((w - 2))
+    print -n -- " "
+    reset
+    ((row++))
+    ((row >= body_h)) && break
+  done
+}
+
+function active_dir { print -r -- "${PANE_DIR[PANE_ACTIVE]}"; }
+
+function active_item_path {
+  typeset dir="${PANE_DIR[PANE_ACTIVE]}"
+  typeset filter="${PANE_FILTER[PANE_ACTIVE]}"
+  typeset -i sel=${PANE_SEL[PANE_ACTIVE]}
+  build_items "$dir" "$filter"
+  ((ITEM_COUNT == 0)) && return 1
+  print -r -- "$dir/${ITEMS[sel]}"
+  return 0
+}
+
+function draw_screen {
+  typeset -i cols=${COLUMNS:-80}
+  typeset -i lines=${LINES:-24}
+
+  typeset -i top=1 footer_h=4 preview_h=6
+  typeset -i pane_h=$((lines - footer_h - preview_h - 1))
+  ((pane_h < 6)) && pane_h=6
+
+  typeset -i pane_w=$((cols / 2))
+  ((pane_w < 20)) && pane_w=20
+
+  typeset -i left_x=1 right_x=$((pane_w + 1))
+
+  [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+
+  draw_pane 0 $left_x $top $pane_w $pane_h
+  draw_pane 1 $right_x $top $((cols - pane_w + 1)) $pane_h
+
+  # Preview
+  typeset -i preview_y=$((top + pane_h + 1))
+  move $preview_y 1
+  dim_on
+  print -n -- "$(printf "%*s" "$cols" "")"
+  dim_off
+  move $preview_y 1
+  print -n -- " Preview (active: "
+  print -n -- $([[ $PANE_ACTIVE -eq 0 ]] && print Left || print Right)
+  print -n -- ") "
+
+  typeset adir="${PANE_DIR[PANE_ACTIVE]}"
+  typeset afilter="${PANE_FILTER[PANE_ACTIVE]}"
+  typeset -i asel=${PANE_SEL[PANE_ACTIVE]}
+  build_items "$adir" "$afilter"
+
+  typeset path=""
+  ((ITEM_COUNT > 0)) && path="$adir/${ITEMS[asel]}"
+
+  typeset -i max_lines=$((preview_h - 2))
+  typeset -i py=$((preview_y + 1)) l
+  for ((l = 0; l < max_lines; l++)); do
+    move $((py + l)) 1
+    print -n -- "$(printf "%*s" "$cols" "")"
+  done
+
+  move $py 1
+  if [[ -z "$path" ]]; then
+    dim_on
+    print -n -- "(nothing selected)"
+    dim_off
+  elif [[ -d "$path" ]]; then
+    print -n -- "Directory: ${path##*/}"
+  else
+    preview_text "$path" "$max_lines" | {
+      typeset line
+      typeset -i row=0
+      while IFS= read -r line && ((row < max_lines)); do
+        move $((py + row)) 1
+        print -n -- "$(truncate "$line" "$cols")"
+        ((row++))
+      done
+    }
+  fi
+
+  # Footer help + status
+  typeset -i footer_y=$((lines - footer_h + 1))
+  move $footer_y 1
+  print -n -- "$(printf "%*s" "$cols" "")"
+  move $footer_y 1
+  print -n -- "[Tab] Switch  [↑/↓] Move  [Enter] Open/Edit  [Backspace] Up  [/] Filter  [Esc] Clear Filter"
+
+  move $((footer_y + 1)) 1
+  print -n -- "$(printf "%*s" "$cols" "")"
+  move $((footer_y + 1)) 1
+  print -n -- "[c] Copy  [m] Move  [p] Paste (into active pane)  [r] Rename  [n] New Folder  [f] New File  [d] Delete  [q] Quit"
+
+  move $((footer_y + 2)) 1
+  print -n -- "$(printf "%*s" "$cols" "")"
+  move $((footer_y + 2)) 1
+  dim_on
+  if [[ -n "$CLIP_MODE" && -n "$CLIP_NAME" ]]; then
+    print -n -- "$(truncate "Clipboard: [$CLIP_MODE] $CLIP_NAME | $STATUS_MSG" "$cols")"
+  else
+    print -n -- "$(truncate "Clipboard: (empty) | $STATUS_MSG" "$cols")"
+  fi
+  dim_off
+}
+
+# ---------- Ops ----------
+function open_item {
+  typeset p
+  p=$(active_item_path) || return 0
+  if [[ -d "$p" ]]; then
+    PANE_DIR[PANE_ACTIVE]="$p"
+    PANE_SEL[PANE_ACTIVE]=0
+    PANE_FILTER[PANE_ACTIVE]=""
+    STATUS_MSG=""
+    return 0
+  fi
+
+  if is_text_editable "${p##*/}"; then
+    [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+    print "Editing: ${p##*/}"
+    print "Exit editor to return (vi: Esc, then :q, Enter)"
+    print "------------------------------------------------"
+    "$VI_CMD" "$p"
+  else
+    [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+    print "Viewing: ${p##*/}"
+    print "Press 'q' to return"
+    print "------------------------------------------------"
+    "${PAGER:-less}" "$p"
+  fi
+  STATUS_MSG=""
+}
+
+function go_up {
+  typeset dir="${PANE_DIR[PANE_ACTIVE]}"
+  PANE_DIR[PANE_ACTIVE]=$("$DIRNAME_CMD" "$dir" 2>/dev/null)
+  [[ -z "${PANE_DIR[PANE_ACTIVE]}" ]] && PANE_DIR[PANE_ACTIVE]="/"
+  PANE_SEL[PANE_ACTIVE]=0
+  PANE_FILTER[PANE_ACTIVE]=""
+  STATUS_MSG=""
+}
+
+function do_copy {
+  typeset p
+  p=$(active_item_path) || {
+    STATUS_MSG="Nothing to copy"
+    return 0
+  }
+  CLIP_MODE="copy"
+  CLIP_NAME="${p##*/}"
+  CLIP_SRC="$p"
+  STATUS_MSG="Copied: $CLIP_NAME"
+}
+
+function do_move {
+  typeset p
+  p=$(active_item_path) || {
+    STATUS_MSG="Nothing to move"
+    return 0
+  }
+  CLIP_MODE="move"
+  CLIP_NAME="${p##*/}"
+  CLIP_SRC="$p"
+  STATUS_MSG="Moving: $CLIP_NAME"
+}
+
+function do_paste {
+  [[ -z "$CLIP_MODE" || -z "$CLIP_SRC" || -z "$CLIP_NAME" ]] && {
+    STATUS_MSG="Clipboard empty"
+    return 0
+  }
+  [[ ! -e "$CLIP_SRC" ]] && {
+    STATUS_MSG="Source missing"
+    CLIP_MODE=""
+    CLIP_NAME=""
+    CLIP_SRC=""
+    return 0
+  }
+
+  typeset dest_dir
+  dest_dir=$(active_dir)
+  typeset dest="$dest_dir/$CLIP_NAME"
+
+  if [[ "$CLIP_MODE" = "copy" ]]; then
+    "$CP_CMD" -r "$CLIP_SRC" "$dest" 2>/dev/null && STATUS_MSG="Pasted: $CLIP_NAME" || STATUS_MSG="Paste failed (copy)"
+  else
+    "$MV_CMD" "$CLIP_SRC" "$dest" 2>/dev/null && {
+      STATUS_MSG="Moved here: $CLIP_NAME"
+      CLIP_MODE=""
+      CLIP_NAME=""
+      CLIP_SRC=""
+    } || STATUS_MSG="Paste failed (move)"
+  fi
+}
+
+function do_delete {
+  typeset p
+  p=$(active_item_path) || {
+    STATUS_MSG="Nothing to delete"
+    return 0
+  }
+  [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+  print -n "Delete '${p##*/}'? (y/N): "
+  read ans
+  [[ "$ans" != "y" && "$ans" != "Y" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  "$RM_CMD" -rf "$p" 2>/dev/null && STATUS_MSG="Deleted: ${p##*/}" || STATUS_MSG="Delete failed"
+  PANE_SEL[PANE_ACTIVE]=0
+}
+
+function do_rename {
+  typeset p
+  p=$(active_item_path) || {
+    STATUS_MSG="Nothing to rename"
+    return 0
+  }
+  typeset dir="${p%/*}" old="${p##*/}"
+  [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+  print -n "Rename '$old' to: "
+  read new
+  [[ -z "$new" || "$new" = "$old" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  "$MV_CMD" "$dir/$old" "$dir/$new" 2>/dev/null && STATUS_MSG="Renamed" || STATUS_MSG="Rename failed"
+}
+
+function do_new_folder {
+  typeset dir
+  dir=$(active_dir)
+  [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+  print -n "New folder name: "
+  read name
+  [[ -z "$name" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  mkdir -p "$dir/$name" 2>/dev/null && STATUS_MSG="Created folder: $name" || STATUS_MSG="Create folder failed"
+}
+
+function do_new_file {
+  typeset dir
+  dir=$(active_dir)
+  [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+  print -n "New file name: "
+  read name
+  [[ -z "$name" ]] && {
+    STATUS_MSG="Cancelled"
+    return 0
+  }
+  : >"$dir/$name" 2>/dev/null && STATUS_MSG="Created file: $name" || STATUS_MSG="Create file failed"
+}
+
+function do_filter {
+  [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+  print -n "Filter (active pane): "
+  read q
+  PANE_FILTER[PANE_ACTIVE]="$q"
+  PANE_SEL[PANE_ACTIVE]=0
+  STATUS_MSG="Filter set"
+}
+
+function clear_filter {
+  PANE_FILTER[PANE_ACTIVE]=""
+  PANE_SEL[PANE_ACTIVE]=0
+  STATUS_MSG="Filter cleared"
+}
+
+# ---------- Key loop ----------
+while :; do
+  draw_screen
+
+  # ksh: read 1 char silently
+  typeset key=""
+  read -r -s -n 1 key
+
+  case "$key" in
+  $'\t')
+    PANE_ACTIVE=$((1 - PANE_ACTIVE))
+    STATUS_MSG=""
+    ;;
+  "") open_item ;;
+  $'\x7f') go_up ;; # Backspace
+  /) do_filter ;;
+  $'\x1b') # ESC or arrow sequence
+    typeset k2=""
+    read -r -s -n 2 -t 1 k2 2>/dev/null
+    case "$k2" in
+    "[A") PANE_SEL[PANE_ACTIVE]=$((PANE_SEL[PANE_ACTIVE] - 1)) ;;
+    "[B") PANE_SEL[PANE_ACTIVE]=$((PANE_SEL[PANE_ACTIVE] + 1)) ;;
+    *) clear_filter ;;
+    esac
+    ;;
+  c) do_copy ;;
+  m) do_move ;;
+  p) do_paste ;;
+  r) do_rename ;;
+  n) do_new_folder ;;
+  f) do_new_file ;;
+  d) do_delete ;;
+  q)
+    [[ -n "$CLEAR_CMD" ]] && "$CLEAR_CMD" || clr
+    print -r -- "${PANE_DIR[PANE_ACTIVE]}"
+    exit 0
+    ;;
+  esac
+done

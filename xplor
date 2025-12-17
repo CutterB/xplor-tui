@@ -1,0 +1,47 @@
+#!/bin/sh
+# xplor launcher: pick best implementation for the user's shell/system.
+# Override:
+#   XPLOR_MODE=tui    -> force bash TUI
+#   XPLOR_MODE=harris -> force ksh88/harris mode
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0" 2>/dev/null || echo .)" && pwd)
+TUI="$SELF_DIR/xplor.bash"
+HARRIS="$SELF_DIR/xplor.ksh88"
+
+# If user forces a mode
+case "${XPLOR_MODE:-}" in
+  tui)
+    exec bash "$TUI" "$@"
+    ;;
+  harris)
+    exec ksh "$HARRIS" "$@"
+    ;;
+esac
+
+# Detect the user's login shell (best signal for "what shell they use")
+USER_SHELL=${SHELL:-}
+
+case "$USER_SHELL" in
+  */ksh|*/ksh88|*/rksh)
+    # Harris-style preference
+    if command -v ksh >/dev/null 2>&1; then
+      exec ksh "$HARRIS" "$@"
+    fi
+    ;;
+  */bash)
+    if command -v bash >/dev/null 2>&1; then
+      exec bash "$TUI" "$@"
+    fi
+    ;;
+esac
+
+# Fallback: prefer bash TUI if available, otherwise ksh88 mode
+if command -v bash >/dev/null 2>&1; then
+  exec bash "$TUI" "$@"
+elif command -v ksh >/dev/null 2>&1; then
+  exec ksh "$HARRIS" "$@"
+else
+  echo "xplor: need bash (TUI mode) or ksh (Harris mode) installed."
+  exit 1
+fi
+
